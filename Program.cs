@@ -86,6 +86,7 @@ foreach (var (taskName, prompt) in tasks)
 
         var content = responseText;
         var ms = sw.ElapsedMilliseconds;
+        if (ms == 0) ms = 1; // avoid divide-by-zero leading to Infinity in metrics
         var chars = content.Length;
         var tokens = EstimateTokens(content);
         var elapsedSeconds = Math.Max(sw.Elapsed.TotalSeconds, 0.000001);
@@ -93,8 +94,13 @@ foreach (var (taskName, prompt) in tasks)
 
         // CPU percent over elapsed window (normalized by logical cores)
         var cpuMs = (cpuEnd - cpuStart).TotalMilliseconds;
-        var cpuPct = Math.Min(100.0, Math.Max(0.0, cpuMs / ms / Environment.ProcessorCount * 100.0));
+        var cpuPct = cpuMs / ms / Environment.ProcessorCount * 100.0;
         var workingSetMb = proc.WorkingSet64 / (1024.0 * 1024.0);
+
+        // sanitize metrics for JSON (no NaN/Infinity)
+        if (double.IsNaN(tokensPerSec) || double.IsInfinity(tokensPerSec)) tokensPerSec = 0;
+        if (double.IsNaN(cpuPct) || double.IsInfinity(cpuPct)) cpuPct = 0;
+        if (double.IsNaN(workingSetMb) || double.IsInfinity(workingSetMb)) workingSetMb = 0;
 
         var result = new BenchResult(alias, taskName, ms, chars);
         results.Add(result);
