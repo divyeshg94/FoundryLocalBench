@@ -39,7 +39,7 @@ var latencies = new Dictionary<string, List<long>>(); // key: model|task
 // prepare output files
 if (File.Exists(jsonlPath)) File.Delete(jsonlPath);
 if (File.Exists(csvPath)) File.Delete(csvPath);
-await File.WriteAllTextAsync(csvPath, "model,task,ms,chars,tokens,tokens_per_sec,cpu_pct,working_set_mb\n");
+await File.WriteAllTextAsync(csvPath, "model,task,ms,chars,tokens,tokens_per_sec,cpu_pct,working_set_mb,response\n");
 
 // Local helpers
 int EstimateTokens(ReadOnlySpan<char> text)
@@ -127,12 +127,14 @@ foreach (var (taskName, prompt) in tasks)
             cpu_pct = Math.Round(cpuPct, 2),
             working_set_mb = Math.Round(workingSetMb, 2),
             prompt_len = prompt.Length,
-            run_id = Guid.NewGuid().ToString("n")
+            run_id = Guid.NewGuid().ToString("n"),
+            response = content
         });
         await File.AppendAllTextAsync(jsonlPath, json + "\n");
 
-        // CSV row
-        await File.AppendAllTextAsync(csvPath, $"{alias},{taskName},{ms},{chars},{tokens},{tokensPerSec:F2},{cpuPct:F2},{workingSetMb:F2}\n");
+        // CSV row (escape quotes/newlines for Excel)
+        var responseCsv = content.Replace("\"", "\"\"").Replace("\r", " ").Replace("\n", " ");
+        await File.AppendAllTextAsync(csvPath, $"{alias},{taskName},{ms},{chars},{tokens},{tokensPerSec:F2},{cpuPct:F2},{workingSetMb:F2},\"{responseCsv}\"\n");
 
         logger.LogInformation("{Alias} | {Task} | {Ms} ms | {Chars} chars | {Tokens} tok | {TokPerSec} tok/s | CPU {CpuPct}% | WS {WsMb} MB",
                               alias, taskName, ms, chars, tokens, tokensPerSec, cpuPct, workingSetMb);
