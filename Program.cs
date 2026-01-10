@@ -23,5 +23,5 @@ var models = await catalog.ListModelsAsync();
 Console.WriteLine($"Models available: {models.Count()}");
 foreach (var model in models)
 {
-    Console.WriteLine($"- {model.Name} ({model.Id})");
+    Console.WriteLine($"- {model.Alias} ({model.Id})");
 }
