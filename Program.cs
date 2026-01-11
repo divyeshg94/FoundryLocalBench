@@ -1,12 +1,23 @@
 ﻿using System.Diagnostics;
 using Microsoft.Extensions.Logging;
+using Microsoft.AI.Foundry.Local;
 using System.Text.Json;
 using System.Text;
+using System.Net.Http;
+using System.Net.Http.Headers;
 
 // Config
 int concurrency = 1; // adjust to run multiple requests in parallel later
 string jsonlPath = "benchmarks.jsonl";
 string csvPath = "benchmarks.csv";
+string agentEndpoint; // e.g., http://localhost:5280
+string agentApiKey; // optional if needed
+
+var httpClient = new HttpClient();
+if (!string.IsNullOrWhiteSpace(agentApiKey))
+{
+    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", agentApiKey);
+}
 
 // You can parameterize this later
 var models = new[]
@@ -65,6 +76,52 @@ int EstimateTokens(ReadOnlySpan<char> text)
     return tokens;
 }
 
+async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
+{
+    var mgr = await FoundryManagerSingleton.GetAsync();
+    // Starting the web service is idempotent; ensure it's started
+    await mgr.StartWebServiceAsync();
+    // Use the manager's configured URL if available
+    agentEndpoint = mgr.Configuration.Web?.Urls ?? agentEndpoint;
+
+    var req = new
+    {
+        model = modelAlias,
+        messages = new object[]
+        {
+            new { role = "system", content = "You are a precise, concise technical assistant." },
+            new { role = "user", content = prompt }
+        }
+    };
+
+    var payload = JsonSerializer.Serialize(req);
+    using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+    try
+    {
+        var resp = await httpClient.PostAsync(new Uri(new Uri(agentEndpoint), "/v1/chat/completions"), content);
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadAsStringAsync();
+
+        // Try to parse OpenAI-style response: { choices: [ { message: { content: "..." } } ] }
+        using var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
+        {
+            var msg = choices[0].GetProperty("message");
+            if (msg.TryGetProperty("content", out var cont))
+            {
+                return cont.GetString() ?? string.Empty;
+            }
+        }
+        // Fallback to plain text
+        return body;
+    }
+    catch (Exception ex)
+    {
+        return $"[Agent error: {ex.Message}] Model {modelAlias} responded to prompt of length {prompt.Length}.";
+    }
+}
+
 foreach (var (taskName, prompt) in tasks)
 {
     Console.WriteLine();
@@ -78,7 +135,7 @@ foreach (var (taskName, prompt) in tasks)
         var cpuStart = proc.TotalProcessorTime;
         var sw = Stopwatch.StartNew();
 
-        var responseText = $"Model {alias} responded to prompt of length {prompt.Length}.";
+        var responseText = await TryInvokeAgentAsync(alias, prompt);
 
         sw.Stop();
         proc.Refresh();
@@ -177,3 +234,43 @@ foreach (var kvp in latencies.OrderBy(k => k.Key))
 
 // Simple record to hold results
 record BenchResult(string Model, string Task, long Ms, int Characters);
+
+// Singleton holder for FoundryLocalManager
+static class FoundryManagerSingleton
+{
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static FoundryLocalManager? _instance;
+
+    public static async Task<FoundryLocalManager> GetAsync()
+    {
+        if (_instance != null) return _instance;
+
+        await Gate.WaitAsync();
+        try
+        {
+            if (_instance != null) return _instance;
+
+            var config = new Configuration
+            {
+                AppName = "foundry-local-bench",
+                LogLevel = Microsoft.AI.Foundry.Local.LogLevel.Information,
+                Web = new Configuration.WebService
+                {
+                    Urls = Environment.GetEnvironmentVariable("FOUNDRY_LOCAL_ENDPOINT") ?? "http://127.0.0.1:55588"
+                }
+            };
+
+            using var lf = LoggerFactory.Create(b => b.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information));
+            var logger = lf.CreateLogger("FoundrySingleton");
+
+            await FoundryLocalManager.CreateAsync(config, logger);
+            _instance = FoundryLocalManager.Instance;
+        }
+        finally
+        {
+            Gate.Release();
+        }
+
+        return _instance!;
+    }
+}
