@@ -1,10 +1,16 @@
-﻿using System.Diagnostics;
-using Microsoft.Extensions.Logging;
-using Microsoft.AI.Foundry.Local;
-using System.Text.Json;
-using System.Text;
+﻿using System.ClientModel;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AI.Foundry.Local;
+using Microsoft.Extensions.Logging;
+using Microsoft.ML.OnnxRuntimeGenAI;
+using OpenAI;
+using Windows.Security.Cryptography.Core;
+using static Betalgo.Ranul.OpenAI.ObjectModels.Models;
+using static Betalgo.Ranul.OpenAI.ObjectModels.RealtimeModels.RealtimeEventTypes;
 
 // Config
 int concurrency = 1; // adjust to run multiple requests in parallel later
@@ -72,59 +78,64 @@ int EstimateTokens(ReadOnlySpan<char> text)
     return tokens;
 }
 
-async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
+async Task<(OpenAIClient, Microsoft.AI.Foundry.Local.Model)> TryInvokeAgentAsync(string modelAlias)
 {
     var mgr = await FoundryManagerSingleton.GetAsync();
-    // Starting the web service is idempotent; ensure it's started
-    await mgr.StartWebServiceAsync();
-    // Use the manager's configured URL if available
-    agentEndpoint = mgr.Urls.FirstOrDefault() ?? agentEndpoint;
-
-    if (string.IsNullOrWhiteSpace(agentEndpoint))
-    {
-        return $"[Error] No agent endpoint available.";
-    }
-
-    var req = new
-    {
-        model = modelAlias,
-        messages = new object[]
-        {
-            new { role = "system", content = "You are a precise, concise technical assistant." },
-            new { role = "user", content = prompt }
-        }
-    };
-
-    var payload = JsonSerializer.Serialize(req);
-    using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-
     try
     {
-        var url = new Uri(new Uri(agentEndpoint), "/v1/chat/completions");
-        var resp = await httpClient.PostAsync(url, content);
-        var body = await resp.Content.ReadAsStringAsync();
-
-        if (!resp.IsSuccessStatusCode)
+        var catalog = await mgr.GetCatalogAsync();
+        var model = await catalog.GetModelAsync(modelAlias) ?? throw new Exception("Model not found");
+        await model.DownloadAsync(p =>
         {
-            return $"[HTTP {(int)resp.StatusCode}] {resp.ReasonPhrase} | Endpoint={url} | Body={body}";
+            Console.Write($"\rDownloading model: {p:F2}%");
+            if (p >= 100f) Console.WriteLine();
+        });
+
+        await model.LoadAsync();
+        await mgr.StartWebServiceAsync();
+
+        agentEndpoint = mgr.Urls.FirstOrDefault() ?? agentEndpoint;
+
+        if (string.IsNullOrWhiteSpace(agentEndpoint))
+        {
+            throw new Exception($"[Error] No agent endpoint available.");
         }
 
-        using var doc = JsonDocument.Parse(body);
-        if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
+        var url = new Uri(new Uri(agentEndpoint), "/v1");
+        var key = new ApiKeyCredential("notneeded");
+        OpenAIClient client = new OpenAIClient(key, new OpenAIClientOptions
         {
-            var msg = choices[0].GetProperty("message");
-            if (msg.TryGetProperty("content", out var cont))
-            {
-                return cont.GetString() ?? string.Empty;
-            }
-        }
-        // Fallback to plain text
-        return body;
+            Endpoint = new Uri(mgr.Urls.FirstOrDefault() + "/v1"),
+        });
+
+        return (client, model);
     }
     catch (Exception ex)
     {
-        return $"[Agent error] {ex.GetType().Name}: {ex.Message}";
+        throw new Exception($"[Agent error] {ex.GetType().Name}: {ex.Message}");
     }
+}
+
+async Task<string> GetChat(OpenAIClient client, Microsoft.AI.Foundry.Local.Model model, string prompt)
+{
+    var chatClient = client.GetChatClient(model.Id);
+
+    var completionUpdates = chatClient.CompleteChatStreaming(prompt);
+
+    var body = "";
+    Console.WriteLine($"[USER]: {prompt}");
+    Console.WriteLine();
+    Console.Write($"[ASSISTANT]: ");
+    foreach (var completionUpdate in completionUpdates)
+    {
+        if (completionUpdate.ContentUpdate.Count > 0)
+        {
+            body += completionUpdate.ContentUpdate[0].Text;
+            Console.Write(completionUpdate.ContentUpdate[0].Text);
+        }
+    }
+    Console.WriteLine();
+    return body;
 }
 
 foreach (var (taskName, prompt) in tasks)
@@ -138,11 +149,13 @@ foreach (var (taskName, prompt) in tasks)
 
         var proc = Process.GetCurrentProcess();
         var cpuStart = proc.TotalProcessorTime;
+
+        var (client, model) = await TryInvokeAgentAsync(alias);
+
         var sw = Stopwatch.StartNew();
-
-        var responseText = await TryInvokeAgentAsync(alias, prompt);
-
+        var responseText = await GetChat(client, model, prompt);
         sw.Stop();
+
         proc.Refresh();
         var cpuEnd = proc.TotalProcessorTime;
 
@@ -262,7 +275,10 @@ static class FoundryManagerSingleton
                 Web = new Configuration.WebService
                 {
                     Urls = Environment.GetEnvironmentVariable("FOUNDRY_LOCAL_ENDPOINT") ?? "http://127.0.0.1:55588"
-                }
+                },
+                AppDataDir = "./foundry_local_data",
+                ModelCacheDir = "{AppDataDir}/model_cache",
+                LogsDir = "{AppDataDir}/logs"
             };
 
             using var lf = LoggerFactory.Create(b => b.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Information));
