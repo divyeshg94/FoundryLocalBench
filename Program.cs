@@ -10,14 +10,11 @@ using System.Net.Http.Headers;
 int concurrency = 1; // adjust to run multiple requests in parallel later
 string jsonlPath = "benchmarks.jsonl";
 string csvPath = "benchmarks.csv";
-string agentEndpoint; // e.g., http://localhost:5280
+string agentEndpoint = ""; // e.g., http://localhost:5280
 string agentApiKey; // optional if needed
 
 var httpClient = new HttpClient();
-if (!string.IsNullOrWhiteSpace(agentApiKey))
-{
-    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", agentApiKey);
-}
+
 
 // You can parameterize this later
 var models = new[]
@@ -82,7 +79,7 @@ async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
     // Starting the web service is idempotent; ensure it's started
     await mgr.StartWebServiceAsync();
     // Use the manager's configured URL if available
-    agentEndpoint = mgr.Configuration.Web?.Urls ?? agentEndpoint;
+    agentEndpoint = mgr.Urls.FirstOrDefault() ?? agentEndpoint;
 
     var req = new
     {
