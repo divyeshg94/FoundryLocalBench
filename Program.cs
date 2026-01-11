@@ -24,10 +24,10 @@ var httpClient = new HttpClient();
 // You can parameterize this later
 var models = new[]
 {
-    "phi-4-mini",
-    "phi-4-mini-reasoning",
+    "phi-3.5-mini",
+    "mistral-7b-v0.2",
     "qwen2.5-1.5b",
-    "deepseek-r1-7b",
+    "deepseek-r1-14b",
     "gpt-oss-20b"
 };
 
@@ -52,7 +52,40 @@ var latencies = new Dictionary<string, List<long>>(); // key: model|task
 // prepare output files
 if (File.Exists(jsonlPath)) File.Delete(jsonlPath);
 if (File.Exists(csvPath)) File.Delete(csvPath);
-await File.WriteAllTextAsync(csvPath, "model,task,ms,chars,tokens,tokens_per_sec,cpu_pct,working_set_mb,response\n");
+await File.WriteAllTextAsync(csvPath, "model,task,ms,chars,tokens,tokens_per_sec,cpu_pct,working_set_mb,gpu_name,gpu_mem_used_mb,gpu_mem_total_mb,gpu_util_pct,response\n");
+
+// NVIDIA metrics helper
+(bool ok, string name, double memUsedMb, double memTotalMb, double utilPct) GetNvidiaMetrics()
+{
+    try
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "nvidia-smi",
+            Arguments = "--query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        using var p = Process.Start(psi);
+        var output = p!.StandardOutput.ReadToEnd();
+        p.WaitForExit(3000);
+        var line = output.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(line)) return (false, "", 0, 0, 0);
+        var parts = line.Split(',', StringSplitOptions.TrimEntries);
+        if (parts.Length < 4) return (false, "", 0, 0, 0);
+        var name = parts[0];
+        double.TryParse(parts[1], out var used);
+        double.TryParse(parts[2], out var total);
+        double.TryParse(parts[3], out var util);
+        return (true, name, used, total, util);
+    }
+    catch
+    {
+        return (false, "", 0, 0, 0);
+    }
+}
 
 // Local helpers
 int EstimateTokens(ReadOnlySpan<char> text)
@@ -200,12 +233,37 @@ foreach (var (taskName, prompt) in tasks)
 
         var (client, model) = await TryInvokeAgentAsync(alias);
 
+        // Capture GPU metrics before inference
+        var gpuBefore = GetNvidiaMetrics();
+
         var sw = Stopwatch.StartNew();
-        var responseText = await GetChat(client, model, prompt);
+
+        // Simple retry with exponential backoff for transient errors
+        string responseText = string.Empty;
+        int maxRetries = 3;
+        int attempt = 0;
+        for (; attempt < maxRetries; attempt++)
+        {
+            try
+            {
+                responseText = await GetChat(client, model, prompt);
+                break;
+            }
+            catch (Exception ex)
+            {
+                var delayMs = (int)Math.Min(2000, 250 * Math.Pow(2, attempt));
+                Console.WriteLine($"[Retry {attempt + 1}/{maxRetries}] {ex.GetType().Name}: {ex.Message}. Waiting {delayMs} ms …");
+                await Task.Delay(delayMs);
+            }
+        }
+
         sw.Stop();
 
         proc.Refresh();
         var cpuEnd = proc.TotalProcessorTime;
+
+        // Capture GPU metrics after inference
+        var gpuAfter = GetNvidiaMetrics();
 
         var content = responseText;
         var ms = sw.ElapsedMilliseconds;
@@ -251,16 +309,22 @@ foreach (var (taskName, prompt) in tasks)
             working_set_mb = Math.Round(workingSetMb, 2),
             prompt_len = prompt.Length,
             run_id = Guid.NewGuid().ToString("n"),
-            response = content
+            response = content,
+            retries = attempt,
+            gpu_name = gpuAfter.name,
+            gpu_mem_used_mb = Math.Round(gpuAfter.memUsedMb, 2),
+            gpu_mem_total_mb = Math.Round(gpuAfter.memTotalMb, 2),
+            gpu_util_pct = Math.Round(gpuAfter.utilPct, 2),
+            gpu_before_util_pct = Math.Round(gpuBefore.utilPct, 2)
         });
         await File.AppendAllTextAsync(jsonlPath, json + "\n");
 
         // CSV row (escape quotes/newlines for Excel)
         var responseCsv = content.Replace("\"", "\"\"").Replace("\r", " ").Replace("\n", " ");
-        await File.AppendAllTextAsync(csvPath, $"{alias},{taskName},{ms},{chars},{tokens},{tokensPerSec:F2},{cpuPct:F2},{workingSetMb:F2},\"{responseCsv}\"\n");
+        await File.AppendAllTextAsync(csvPath, $"{alias},{taskName},{ms},{chars},{tokens},{tokensPerSec:F2},{cpuPct:F2},{workingSetMb:F2},\"{gpuAfter.name}\",{gpuAfter.memUsedMb:F2},{gpuAfter.memTotalMb:F2},{gpuAfter.utilPct:F2},\"{responseCsv}\"\n");
 
-        logger.LogInformation("{Alias} | {Task} | {Ms} ms | {Chars} chars | {Tokens} tok | {TokPerSec} tok/s | CPU {CpuPct}% | WS {WsMb} MB",
-                              alias, taskName, ms, chars, tokens, tokensPerSec, cpuPct, workingSetMb);
+        logger.LogInformation("{Alias} | {Task} | {Ms} ms | {Chars} chars | {Tokens} tok | {TokPerSec} tok/s | CPU {CpuPct}% | WS {WsMb} MB | GPU {GpuName} util {GpuUtil}% mem {GpuMemUsed}/{GpuMemTotal} MB | Retries {Retries}",
+                              alias, taskName, ms, chars, tokens, tokensPerSec, cpuPct, workingSetMb, gpuAfter.name, gpuAfter.utilPct, gpuAfter.memUsedMb, gpuAfter.memTotalMb, attempt);
 
         var snippet = content.Length > 300 ? content[..300] + "…" : content;
         Console.WriteLine($"> {alias} snippet:\n{snippet}\n");
