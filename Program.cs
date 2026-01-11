@@ -15,7 +15,6 @@ string agentApiKey; // optional if needed
 
 var httpClient = new HttpClient();
 
-
 // You can parameterize this later
 var models = new[]
 {
@@ -81,6 +80,11 @@ async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
     // Use the manager's configured URL if available
     agentEndpoint = mgr.Urls.FirstOrDefault() ?? agentEndpoint;
 
+    if (string.IsNullOrWhiteSpace(agentEndpoint))
+    {
+        return $"[Error] No agent endpoint available.";
+    }
+
     var req = new
     {
         model = modelAlias,
@@ -96,11 +100,15 @@ async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
 
     try
     {
-        var resp = await httpClient.PostAsync(new Uri(new Uri(agentEndpoint), "/v1/chat/completions"), content);
-        resp.EnsureSuccessStatusCode();
+        var url = new Uri(new Uri(agentEndpoint), "/v1/chat/completions");
+        var resp = await httpClient.PostAsync(url, content);
         var body = await resp.Content.ReadAsStringAsync();
 
-        // Try to parse OpenAI-style response: { choices: [ { message: { content: "..." } } ] }
+        if (!resp.IsSuccessStatusCode)
+        {
+            return $"[HTTP {(int)resp.StatusCode}] {resp.ReasonPhrase} | Endpoint={url} | Body={body}";
+        }
+
         using var doc = JsonDocument.Parse(body);
         if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
         {
@@ -115,7 +123,7 @@ async Task<string> TryInvokeAgentAsync(string modelAlias, string prompt)
     }
     catch (Exception ex)
     {
-        return $"[Agent error: {ex.Message}] Model {modelAlias} responded to prompt of length {prompt.Length}.";
+        return $"[Agent error] {ex.GetType().Name}: {ex.Message}";
     }
 }
 
