@@ -120,22 +120,70 @@ async Task<string> GetChat(OpenAIClient client, Microsoft.AI.Foundry.Local.Model
 {
     var chatClient = client.GetChatClient(model.Id);
 
-    var completionUpdates = chatClient.CompleteChatStreaming(prompt);
-
-    var body = "";
-    Console.WriteLine($"[USER]: {prompt}");
-    Console.WriteLine();
-    Console.Write($"[ASSISTANT]: ");
-    foreach (var completionUpdate in completionUpdates)
+    // Prefer non-streaming to avoid HttpIOException: Response ended prematurely
+    try
     {
-        if (completionUpdate.ContentUpdate.Count > 0)
+        var completion = chatClient.CompleteChat(prompt);
+        var comp = completion.Value;
+        string text = string.Empty;
+
+        // Prefer comp.Content (list of content parts)
+        if (comp?.Content != null && comp.Content.Count > 0)
         {
-            body += completionUpdate.ContentUpdate[0].Text;
-            Console.Write(completionUpdate.ContentUpdate[0].Text);
+            text = comp.Content[0].Text ?? string.Empty;
         }
+        else
+        {
+            // Fallback: serialize result and attempt to extract message content
+            var raw = JsonSerializer.Serialize(comp);
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                if (doc.RootElement.TryGetProperty("content", out var contentArr) && contentArr.ValueKind == JsonValueKind.Array && contentArr.GetArrayLength() > 0)
+                {
+                    var first = contentArr[0];
+                    if (first.TryGetProperty("text", out var t))
+                    {
+                        text = t.GetString() ?? string.Empty;
+                    }
+                }
+            }
+            catch
+            {
+                // ignore parse fallback errors
+            }
+        }
+
+        Console.WriteLine($"[USER]: {prompt}\n\n[ASSISTANT]: {text}\n");
+        return text;
     }
-    Console.WriteLine();
-    return body;
+    catch (Exception ex)
+    {
+        // Fallback to streaming with defensive accumulation
+        var completionUpdates = chatClient.CompleteChatStreaming(prompt);
+        var body = new StringBuilder();
+        Console.WriteLine($"[USER]: {prompt}\n");
+        Console.Write("[ASSISTANT]: ");
+        try
+        {
+            foreach (var update in completionUpdates)
+            {
+                if (update.ContentUpdate.Count > 0)
+                {
+                    var chunk = update.ContentUpdate[0].Text ?? string.Empty;
+                    body.Append(chunk);
+                    Console.Write(chunk);
+                }
+            }
+        }
+        catch (HttpIOException)
+        {
+            // Partial response collected; print a notice and continue
+            Console.WriteLine("\n[Warning] Stream ended prematurely, using partial response.");
+        }
+        Console.WriteLine();
+        return body.ToString();
+    }
 }
 
 foreach (var (taskName, prompt) in tasks)
